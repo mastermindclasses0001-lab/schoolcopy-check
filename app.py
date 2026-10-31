@@ -1,351 +1,300 @@
 import streamlit as st
-import google.generativeai as genai
 import sqlite3
 import datetime
-import pandas as pd
-from fpdf import FPDF
-import io
-import json
-import re
 import os
+import json
+import pandas as pd
+from io import BytesIO
+from fpdf import FPDF
+import google.generativeai as genai
 from PIL import Image
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Safal Academy Live", page_icon="🎓", layout="wide")
+# ==========================================
+# 1. PAGE CONFIG & CUSTOM CSS (Dark Theme)
+# ==========================================
+st.set_page_config(page_title="Safal Academy Live | Copy Checker", layout="wide")
 
-# --- CUSTOM CSS FOR BETTER UI ---
 st.markdown("""
     <style>
-    .main-title { text-align: center; color: #1E3A8A; font-weight: bold; font-size: 40px; margin-bottom: -10px;}
-    .sub-title { text-align: center; color: #DC2626; font-size: 20px; font-weight: bold; margin-bottom: 30px;}
-    .checking-text { text-align: center; color: #047857; font-size: 24px; font-weight: bold; margin-top: 20px;}
+    .main { background-color: #0d0d0d; color: #ffffff; }
+    h1, h2, h3 { color: #ffeb3b; text-shadow: 2px 2px 4px #000000; }
+    .stButton>button { background-color: #ff3d00; color: white; border-radius: 8px; font-weight: bold; border: 2px solid #ffeb3b; }
+    .stButton>button:hover { background-color: #00e676; border-color: #ffffff; color: black; }
+    .stTextInput>div>div>input, .stSelectbox>div>div>select, .stTextArea>div>textarea { background-color: #1a1a1a; color: #00e5ff; border: 1px solid #ff3d00; }
+    .branding { text-align: center; color: #00e676; font-size: 24px; font-weight: bold; padding: 10px; margin-bottom: 20px; border-bottom: 2px solid #ffeb3b; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- DATABASE SETUP ---
-def init_db():
-    conn = sqlite3.connect("safal_academy.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS tests (
-                    test_code TEXT PRIMARY KEY, class_name TEXT, subject TEXT, 
-                    total_marks INTEGER, questions TEXT, answers TEXT, expiry_date TEXT
-                 )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, test_code TEXT, 
-                    student_name TEXT, mobile TEXT, school TEXT, class_name TEXT,
-                    obtained_marks INTEGER, eval_data TEXT, timestamp TEXT
-                 )''')
-    conn.commit()
-    conn.close()
+# ==========================================
+# 2. DATABASE SETUP (SQLite)
+# ==========================================
+conn = sqlite3.connect("safal_academy.db", check_same_thread=False)
+cursor = conn.cursor()
 
-init_db()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS tests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    class_name TEXT, subject TEXT, test_code TEXT UNIQUE,
+    total_marks INTEGER, questions TEXT, ideal_answers TEXT, expiry_datetime TEXT
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_code TEXT, student_name TEXT, mobile TEXT, school_name TEXT, class_name TEXT,
+    obtained_marks REAL, evaluation_json TEXT
+)
+""")
+conn.commit()
 
-# --- HELPER FUNCTIONS ---
-def get_db_connection():
-    return sqlite3.connect("safal_academy.db")
+# ==========================================
+# 3. AI CONFIGURATION (Gemini)
+# ==========================================
+# Fetching from Render Environment Variable
+API_KEY = os.environ.get("GEMINI_API_KEY", "") 
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+else:
+    st.warning("⚠️ API Key not found in Environment Variables! Please add GEMINI_API_KEY in Render.")
 
-def extract_json(text):
-    match = re.search(r'```(?:json)?(.*?)```', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-# --- PDF GENERATORS ---
-class StudentPDF(FPDF):
+# ==========================================
+# 4. PDF GENERATION CLASSES
+# ==========================================
+class PDF(FPDF):
     def header(self):
-        self.set_fill_color(30, 58, 138) # Dark Blue
-        self.rect(0, 0, 210, 40, 'F')
-        self.set_font('Arial', 'B', 24)
-        self.set_text_color(255, 255, 255)
-        self.cell(0, 10, 'SAFAL ACADEMY LIVE', 0, 1, 'C')
-        self.set_font('Arial', 'I', 12)
-        self.set_text_color(220, 38, 38) # Redish
-        self.cell(0, 10, 'Powered by Ravish Sir', 0, 1, 'C')
-        self.ln(10)
-
-def generate_student_pdf(student_data, test_data, eval_json):
-    pdf = StudentPDF()
-    pdf.add_page()
-    
-    # Student Info
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.set_text_color(0, 0, 0)
-    
-    info = f"Name: {student_data['name']} | Class: {student_data['class_name']} | Mob: {student_data['mobile']}\n"
-    info += f"School: {student_data['school']}\n"
-    info += f"Subject: {test_data['subject']} (Code: {test_data['test_code']})"
-    pdf.multi_cell(0, 8, info, border=1, fill=True)
-    pdf.ln(5)
-    
-    # Score
-    pdf.set_font('Arial', 'B', 16)
-    pdf.set_text_color(0, 128, 0)
-    pdf.cell(0, 10, f"Score: {eval_json.get('total_obtained_marks', 0)} / {test_data['total_marks']}", 0, 1, 'C')
-    pdf.ln(5)
-    
-    # QA Breakdown
-    for qa in eval_json.get('evaluation', []):
-        pdf.set_font('Arial', 'B', 12)
-        pdf.set_text_color(30, 58, 138)
-        pdf.cell(0, 8, f"{qa.get('question_number', 'Q')}: Marks: {qa.get('obtained_marks', 0)}", 0, 1)
-        
-        pdf.set_font('Arial', '', 11)
-        pdf.set_text_color(0, 0, 0)
-        pdf.multi_cell(0, 6, f"Student Answer: {qa.get('student_answer', '')}")
-        
-        pdf.set_text_color(220, 38, 38)
-        pdf.multi_cell(0, 6, f"Cause of Deduction: {qa.get('deduction_cause', 'None')}")
-        
-        pdf.set_text_color(0, 128, 0)
-        pdf.multi_cell(0, 6, f"Ideal Answer: {qa.get('ideal_answer', '')}")
-        pdf.ln(5)
-        
-    return pdf.output(dest='S').encode('latin1')
-
-def generate_teacher_pdf(test_code, test_data, results_df):
-    pdf = StudentPDF()
-    pdf.add_page()
-    
-    pdf.set_font('Arial', 'B', 16)
-    pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 10, f"Rank List - {test_data['subject']} (Code: {test_code})", 0, 1, 'C')
-    pdf.set_font('Arial', '', 12)
-    pdf.cell(0, 8, f"Class: {test_data['class_name']} | Full Marks: {test_data['total_marks']}", 0, 1, 'C')
-    pdf.ln(10)
-    
-    # Table Header
-    pdf.set_fill_color(30, 58, 138)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.cell(20, 10, 'Rank', 1, 0, 'C', True)
-    pdf.cell(80, 10, 'Student Name', 1, 0, 'C', True)
-    pdf.cell(50, 10, 'Mobile', 1, 0, 'C', True)
-    pdf.cell(40, 10, 'Marks', 1, 1, 'C', True)
-    
-    # Table Rows
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font('Arial', '', 11)
-    
-    for idx, row in results_df.iterrows():
-        fill = True if idx % 2 == 0 else False
-        pdf.set_fill_color(240, 240, 240)
-        pdf.cell(20, 10, str(idx + 1), 1, 0, 'C', fill)
-        pdf.cell(80, 10, str(row['student_name'])[:30], 1, 0, 'L', fill)
-        pdf.cell(50, 10, str(row['mobile']), 1, 0, 'C', fill)
-        pdf.cell(40, 10, str(row['obtained_marks']), 1, 1, 'C', fill)
-        
-    return pdf.output(dest='S').encode('latin1')
-
-# --- MAIN APP ---
-st.markdown("<div class='main-title'>SAFAL ACADEMY LIVE</div>", unsafe_allow_html=True)
-st.markdown("<div class='sub-title'>Powered by Ravish Sir</div>", unsafe_allow_html=True)
-
-# API Key Config
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    api_key = st.sidebar.text_input("🔑 Gemini API Key (Required)", type="password")
-    if not api_key:
-        st.warning("Please configure Gemini API Key to run evaluation.")
-
-if api_key:
-    genai.configure(api_key=api_key)
-
-portal = st.sidebar.radio("Select Portal", ["🧑‍🎓 Student Portal", "👨‍🏫 Teacher Portal"])
+        self.set_font("Arial", 'B', 20)
+        self.set_text_color(255, 61, 0) # Vivid Red
+        self.cell(0, 10, "SAFAL ACADEMY LIVE", ln=True, align="C")
+        self.set_font("Arial", 'I', 12)
+        self.set_text_color(0, 230, 118) # Vivid Green
+        self.cell(0, 10, "Powered by Ravish Sir", ln=True, align="C")
+        self.ln(5)
 
 # ==========================================
-# TEACHER PORTAL
+# 5. TEACHER PORTAL
 # ==========================================
-if portal == "👨‍🏫 Teacher Portal":
-    st.sidebar.markdown("---")
-    teacher_pass = st.sidebar.text_input("Teacher Password", type="password")
-    
-    if teacher_pass != "525077":
-        st.error("🔒 Please enter correct Teacher Password to access this portal.")
-    else:
-        st.success("✅ Logged in as Teacher (Ravish Sir)")
-        tab1, tab2 = st.tabs(["📝 Create New Test", "📊 Download Reports"])
-        
-        # --- TAB 1: CREATE TEST ---
-        with tab1:
-            st.subheader("Publish a New Test")
-            with st.form("create_test_form"):
-                col1, col2 = st.columns(2)
-                t_class = col1.selectbox("Class", [str(i) for i in range(7, 13)])
-                t_sub = col2.text_input("Subject Name")
-                t_code = col1.text_input("Unique Test Code (e.g., PHY101)")
-                t_marks = col2.number_input("Total Marks", min_value=1)
-                
-                t_expiry = st.date_input("Expiry Date")
-                t_time = st.time_input("Expiry Time")
-                
-                t_questions = st.text_area("Paste All Questions Here", height=150)
-                t_answers = st.text_area("Paste Ideal Answer Key Here", height=150)
-                
-                submit_test = st.form_submit_button("🚀 Publish Test Live")
-                
-                if submit_test:
-                    if t_code and t_sub:
-                        conn = get_db_connection()
-                        c = conn.cursor()
-                        expiry_datetime = f"{t_expiry} {t_time}"
-                        try:
-                            c.execute("INSERT INTO tests VALUES (?,?,?,?,?,?,?)", 
-                                      (t_code, t_class, t_sub, t_marks, t_questions, t_answers, expiry_datetime))
-                            conn.commit()
-                            st.success(f"Test {t_code} published successfully! It is now live for students.")
-                        except sqlite3.IntegrityError:
-                            st.error("Test Code already exists! Please use a unique code.")
-                        conn.close()
-                    else:
-                        st.error("Please fill all required fields.")
-                        
-        # --- TAB 2: REPORTS ---
-        with tab2:
-            st.subheader("Generate & Download Results")
-            conn = get_db_connection()
-            tests = pd.read_sql_query("SELECT test_code, class_name, subject, total_marks FROM tests", conn)
-            
-            if not tests.empty:
-                col1, col2 = st.columns(2)
-                sel_class = col1.selectbox("Filter by Class", ["All"] + [str(i) for i in range(7, 13)])
-                
-                filtered_tests = tests if sel_class == "All" else tests[tests['class_name'] == sel_class]
-                sel_test = col2.selectbox("Select Test Code", filtered_tests['test_code'].tolist())
-                
-                if sel_test:
-                    results = pd.read_sql_query(f"SELECT * FROM results WHERE test_code='{sel_test}' ORDER BY obtained_marks DESC", conn)
-                    test_info = tests[tests['test_code'] == sel_test].iloc[0]
-                    
-                    if not results.empty:
-                        st.dataframe(results[['student_name', 'mobile', 'school', 'obtained_marks', 'timestamp']])
-                        
-                        col3, col4 = st.columns(2)
-                        # Download PDF
-                        pdf_bytes = generate_teacher_pdf(sel_test, test_info, results)
-                        col3.download_button("📥 Download Colorful Rank PDF", data=pdf_bytes, file_name=f"Ranklist_{sel_test}.pdf", mime="application/pdf")
-                        
-                        # Download Excel
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            results.drop(columns=['eval_data']).to_excel(writer, index=False, sheet_name="Results")
-                        excel_bytes = output.getvalue()
-                        col4.download_button("📥 Download Excel Sheet", data=excel_bytes, file_name=f"Data_{sel_test}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                        
-                    else:
-                        st.info("No students have submitted this test yet.")
+def teacher_portal():
+    st.markdown('<div class="branding">👨‍🏫 Teacher Portal</div>', unsafe_allow_html=True)
+    if "teacher_logged_in" not in st.session_state:
+        st.session_state.teacher_logged_in = False
+
+    if not st.session_state.teacher_logged_in:
+        pwd = st.text_input("Enter Teacher Password", type="password")
+        if st.button("Login"):
+            if pwd == "525077":
+                st.session_state.teacher_logged_in = True
+                st.rerun()
             else:
-                st.info("No tests created yet.")
-            conn.close()
+                st.error("❌ Incorrect Password!")
+        return
+
+    if st.button("Logout"):
+        st.session_state.teacher_logged_in = False
+        st.rerun()
+
+    tab1, tab2 = st.tabs(["📝 Create New Test", "📊 Download Reports"])
+
+    with tab1:
+        with st.form("create_test_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                class_name = st.selectbox("Class", [f"Class {i}" for i in range(7, 13)])
+                subject = st.text_input("Subject")
+                test_code = st.text_input("Test Code (Unique)")
+                total_marks = st.number_input("Total Marks", min_value=1)
+            with col2:
+                exp_date = st.date_input("Expiry Date")
+                exp_time = st.time_input("Expiry Time")
+            
+            questions = st.text_area("Paste All Questions Here")
+            ideal_answers = st.text_area("Paste Ideal Answers / Marking Scheme Here")
+            
+            if st.form_submit_button("Launch Test"):
+                if subject and test_code and questions and ideal_answers:
+                    expiry_str = datetime.datetime.combine(exp_date, exp_time).strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        cursor.execute("INSERT INTO tests (class_name, subject, test_code, total_marks, questions, ideal_answers, expiry_datetime) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                       (class_name, subject, test_code, total_marks, questions, ideal_answers, expiry_str))
+                        conn.commit()
+                        st.success(f"✅ Test '{test_code}' is now Live until {expiry_str}!")
+                    except sqlite3.IntegrityError:
+                        st.error("⚠️ Test Code already exists! Choose a different one.")
+                else:
+                    st.error("⚠️ Please fill all fields.")
+
+    with tab2:
+        cursor.execute("SELECT test_code FROM tests")
+        tests = [row[0] for row in cursor.fetchall()]
+        if tests:
+            selected_test = st.selectbox("Select Test Code for Report", tests)
+            if st.button("Generate Reports"):
+                df = pd.read_sql_query(f"SELECT student_name, mobile, school_name, class_name, obtained_marks FROM results WHERE test_code='{selected_test}' ORDER BY obtained_marks DESC", conn)
+                
+                if not df.empty:
+                    df.insert(0, 'Rank', range(1, 1 + len(df)))
+                    st.dataframe(df)
+
+                    # Excel Download
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False, sheet_name="Rank List")
+                    st.download_button("📥 Download Excel Sheet", data=output.getvalue(), file_name=f"{selected_test}_RankList.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    
+                    # PDF Download
+                    pdf = PDF()
+                    pdf.add_page()
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.set_text_color(0, 229, 255) # Light Blue
+                    pdf.cell(0, 10, f"Rank List - Test Code: {selected_test}", ln=True, align="C")
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.set_text_color(255, 255, 255)
+                    
+                    for index, row in df.iterrows():
+                        pdf.set_text_color(255, 235, 59) # Yellow
+                        pdf.cell(0, 10, f"Rank {row['Rank']}: {row['student_name']} ({row['school_name']}) - Marks: {row['obtained_marks']}", ln=True)
+                    
+                    pdf_bytes = pdf.output(dest='S').encode('latin-1', 'replace')
+                    st.download_button("📥 Download Colorful PDF", data=pdf_bytes, file_name=f"{selected_test}_Ranks.pdf", mime="application/pdf")
+                else:
+                    st.warning("No students have submitted this test yet.")
+        else:
+            st.info("No tests created yet.")
 
 # ==========================================
-# STUDENT PORTAL
+# 6. STUDENT PORTAL
 # ==========================================
-elif portal == "🧑‍🎓 Student Portal":
+def student_portal():
+    st.markdown('<div class="branding">🎓 Student Portal</div>', unsafe_allow_html=True)
     
-    # 1. Fetch Active Tests
-    conn = get_db_connection()
+    col1, col2 = st.columns(2)
+    with col1:
+        student_name = st.text_input("Full Name")
+        mobile = st.text_input("Mobile Number (10 digits)", max_chars=10)
+    with col2:
+        school_name = st.text_input("School Name")
+        class_name = st.selectbox("Select Class", [f"Class {i}" for i in range(7, 13)])
+    
+    # Fetch Active Tests for the Class
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    active_tests = pd.read_sql_query(f"SELECT * FROM tests WHERE expiry_date >= '{now_str}'", conn)
-    conn.close()
+    cursor.execute("SELECT subject, test_code, total_marks, questions, ideal_answers FROM tests WHERE class_name=? AND expiry_datetime > ?", (class_name, now_str))
+    active_tests = cursor.fetchall()
+
+    if not active_tests:
+        st.info(f"No active tests available for {class_name} at the moment.")
+        return
+
+    test_options = {f"{t[0]} (Code: {t[1]})": t for t in active_tests}
+    selected_test_label = st.selectbox("Select Active Test", list(test_options.keys()))
+    test_data = test_options[selected_test_label]
     
-    if active_tests.empty:
-        st.warning("No active tests available right now. Please check back later.")
-    else:
-        st.subheader("📋 Exam Submission Form")
-        s_class = st.selectbox("Select Your Class", sorted(list(set(active_tests['class_name']))))
-        
-        class_tests = active_tests[active_tests['class_name'] == s_class]
-        
-        if class_tests.empty:
-            st.info("No tests currently active for your class.")
-        else:
-            test_options = class_tests.apply(lambda x: f"{x['test_code']} - {x['subject']} (Full Marks: {x['total_marks']})", axis=1).tolist()
-            s_test_display = st.selectbox("Select Test", test_options)
-            s_test_code = s_test_display.split(" - ")[0]
-            
-            with st.form("student_details_form"):
-                st.write("**Enter Your Details**")
-                s_name = st.text_input("Full Name")
-                s_mob = st.text_input("Mobile Number (10 digits)")
-                s_school = st.text_input("School Name")
+    st.info(f"Subject: {test_data[0]} | Max Marks: {test_data[2]}")
+    
+    uploaded_files = st.file_uploader("Upload Answer Sheets (Max 20 Pages)", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+    
+    if st.button("Submit & Check Answer Sheet"):
+        if not (student_name and len(mobile) == 10 and school_name):
+            st.error("⚠️ Please fill your Name, correct Mobile Number, and School Name.")
+            return
+        if not uploaded_files:
+            st.error("⚠️ Please upload at least one image of your answer sheet.")
+            return
+        if len(uploaded_files) > 20:
+            st.error("⚠️ Maximum 20 pages allowed.")
+            return
+
+        with st.spinner("⏳ Ravish Sir Checking... Please Wait..."):
+            try:
+                images = [Image.open(f) for f in uploaded_files]
                 
-                st.write("**Upload Answer Sheets (Max 20 pages)**")
-                st.info("Please capture clear photos of your handwritten answer sheets.")
-                uploaded_images = st.file_uploader("Upload Image Files (JPG/PNG)", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
+                prompt = f"""
+                You are an expert strict examiner for Safal Academy Live.
+                Evaluate the student's handwritten answer sheets against these questions:
+                {test_data[3]}
+                And this ideal answer key/marking scheme:
+                {test_data[4]}
+                Max Marks: {test_data[2]}
                 
-                submit_btn = st.form_submit_button("📤 Submit for Evaluation")
-            
-            if submit_btn:
-                if not s_name or not s_mob or len(s_mob) != 10 or not s_school:
-                    st.error("Please fill all details correctly (Mobile must be 10 digits).")
-                elif not uploaded_images:
-                    st.error("Please upload at least 1 photo of your answer sheet.")
-                elif len(uploaded_images) > 20:
-                    st.error("You can upload a maximum of 20 images.")
-                else:
-                    st.markdown("<div class='checking-text'>⏳ Ravish Sir Checking... Please Wait...</div>", unsafe_allow_html=True)
-                    
-                    try:
-                        # Prepare images for Gemini
-                        gemini_images = []
-                        for img in uploaded_images:
-                            image = Image.open(img)
-                            gemini_images.append(image)
-                        
-                        test_row = class_tests[class_tests['test_code'] == s_test_code].iloc[0]
-                        questions = test_row['questions']
-                        answers = test_row['answers']
-                        total_marks = test_row['total_marks']
-                        
-                        prompt = f"""
-                        You are a strict evaluator. Read the attached handwritten answer sheets.
-                        Compare them against this Answer Key:
-                        QUESTIONS:
-                        {questions}
-                        
-                        IDEAL ANSWERS / MARKING SCHEME:
-                        {answers}
-                        
-                        Evaluate strictly. Return ONLY a valid JSON object in this exact format:
+                Respond STRICTLY in valid JSON format:
+                {{
+                    "total_obtained_marks": <number>,
+                    "evaluation": [
                         {{
-                            "total_obtained_marks": <total marks as integer>,
-                            "evaluation": [
-                                {{
-                                    "question_number": "Q1",
-                                    "student_answer": "text read from image",
-                                    "obtained_marks": <int>,
-                                    "deduction_cause": "why marks cut (or 'None')",
-                                    "ideal_answer": "the correct answer context"
-                                }}
-                            ]
+                            "question_number": <number or string>,
+                            "student_answer": "<brief summary of what student wrote>",
+                            "obtained_marks": <number>,
+                            "cause_of_deduction": "<reason why marks were cut, or 'Perfect' if full marks>",
+                            "ideal_answer": "<correct answer concept>"
                         }}
-                        Ensure valid JSON output without markdown wrapper if possible.
-                        """
-                        
-                        model = genai.GenerativeModel('gemini-1.5-flash')
-                        response = model.generate_content([prompt] + gemini_images)
-                        
-                        json_str = extract_json(response.text)
-                        eval_data = json.loads(json_str)
-                        obtained_marks = eval_data.get('total_obtained_marks', 0)
-                        
-                        # Save to DB
-                        conn = get_db_connection()
-                        c = conn.cursor()
-                        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        c.execute("INSERT INTO results (test_code, student_name, mobile, school, class_name, obtained_marks, eval_data, timestamp) VALUES (?,?,?,?,?,?,?,?)",
-                                  (s_test_code, s_name, s_mob, s_school, s_class, obtained_marks, json.dumps(eval_data), now))
-                        conn.commit()
-                        conn.close()
-                        
-                        st.success(f"✅ Checking Complete! You scored: {obtained_marks} / {total_marks}")
-                        
-                        # Generate Student PDF
-                        student_info = {"name": s_name, "class_name": s_class, "mobile": s_mob, "school": s_school}
-                        pdf_bytes = generate_student_pdf(student_info, test_row, eval_data)
-                        
-                        st.download_button("📥 Download Your Detailed Answer Report (PDF)", data=pdf_bytes, file_name=f"Report_{s_name}.pdf", mime="application/pdf")
-                        
-                    except Exception as e:
-                        st.error(f"❌ Error during evaluation: Make sure images are clear. Error details: {e}")
+                    ]
+                }}
+                Do not include markdown tags like ```json in the output.
+                """
+                
+                response = model.generate_content([prompt] + images)
+                raw_json = response.text.replace("```json", "").replace("```", "").strip()
+                eval_data = json.loads(raw_json)
+                
+                # Save to Database
+                cursor.execute("INSERT INTO results (test_code, student_name, mobile, school_name, class_name, obtained_marks, evaluation_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (test_data[1], student_name, mobile, school_name, class_name, eval_data['total_obtained_marks'], json.dumps(eval_data)))
+                conn.commit()
+                
+                st.success(f"✅ Evaluation Complete! You scored {eval_data['total_obtained_marks']} / {test_data[2]}")
+                
+                # Generate Student PDF
+                pdf = PDF()
+                pdf.add_page()
+                
+                # Header Details
+                pdf.set_font("Arial", 'B', 14)
+                pdf.set_text_color(0, 229, 255)
+                pdf.cell(0, 8, f"Name: {student_name} | Class: {class_name}", ln=True)
+                pdf.cell(0, 8, f"School: {school_name} | Mobile: {mobile}", ln=True)
+                pdf.cell(0, 8, f"Subject: {test_data[0]} | Test Code: {test_data[1]}", ln=True)
+                pdf.set_text_color(255, 235, 59)
+                pdf.cell(0, 10, f"RESULT: {eval_data['total_obtained_marks']} / {test_data[2]} Marks", ln=True)
+                pdf.ln(5)
+                
+                # Evaluation Breakdown
+                for item in eval_data.get('evaluation', []):
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.set_text_color(255, 61, 0)
+                    pdf.multi_cell(0, 8, f"Question {item['question_number']}")
+                    
+                    pdf.set_font("Arial", '', 11)
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.multi_cell(0, 6, f"Student Answer: {item['student_answer']}")
+                    
+                    pdf.set_font("Arial", 'B', 11)
+                    pdf.set_text_color(0, 150, 0)
+                    pdf.multi_cell(0, 6, f"Obtained Marks: {item['obtained_marks']}")
+                    
+                    pdf.set_font("Arial", 'I', 11)
+                    pdf.set_text_color(200, 0, 0)
+                    pdf.multi_cell(0, 6, f"Cause of Deduction: {item['cause_of_deduction']}")
+                    
+                    pdf.set_font("Arial", '', 11)
+                    pdf.set_text_color(0, 0, 150)
+                    pdf.multi_cell(0, 6, f"Ideal Answer: {item['ideal_answer']}")
+                    pdf.ln(4)
+                
+                pdf_bytes = pdf.output(dest='S').encode('latin-1', 'replace')
+                st.download_button("📥 Download Your Detailed Report (PDF)", data=pdf_bytes, file_name=f"{student_name}_Report.pdf", mime="application/pdf")
+                
+            except Exception as e:
+                st.error(f"❌ Error during evaluation: {str(e)}. Please try again or upload clearer photos.")
+
+# ==========================================
+# 7. APP ROUTING
+# ==========================================
+st.sidebar.title("Safal Academy Live")
+st.sidebar.markdown("**Powered by Ravish Sir**")
+portal_choice = st.sidebar.radio("Select Portal", ["Student Portal", "Teacher Portal"])
+
+if portal_choice == "Teacher Portal":
+    teacher_portal()
+else:
+    student_portal()
