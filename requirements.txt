@@ -1,2 +1,15 @@
+<!-- ... existing code ... -->
+
 streamlit
+
 google-generativeai
+
+fpdf
+
+pandas
+
+openpyxl
+
+Pillow
+
+<!-- ... existing code ... -->
