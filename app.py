@@ -60,7 +60,8 @@ if API_KEY:
 else:
     st.warning("⚠️ API Key not found in Environment Variables! Please add GEMINI_API_KEY in Render.")
 
-model = genai.GenerativeModel('gemini-1.5-flash-latest')
+# Yahan Stable Version 'gemini-1.5-flash-001' use kiya gaya hai
+model = genai.GenerativeModel('gemini-1.5-flash-001')
 
 # ==========================================
 # 4. PDF GENERATION CLASSES
